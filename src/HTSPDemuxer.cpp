@@ -155,6 +155,7 @@ bool CHTSPDemuxer::Seek
 
   tvhdebug("demux seek %d", time);
   m_seeking = true;
+  m_seekTime = 0;
 
   /* Build message */
   m = htsmsg_create_map();  
@@ -172,7 +173,6 @@ bool CHTSPDemuxer::Seek
   htsmsg_destroy(m);
 
   /* Wait for time */
-  m_seekTime = 0;
   if (!m_seekCond.Wait(m_conn.Mutex(), m_seekTime, tvh->GetSettings().iResponseTimeout))
   {
     tvherror("failed to get subscriptionSeek response");
