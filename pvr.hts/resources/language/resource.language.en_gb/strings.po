@@ -54,7 +54,15 @@ msgctxt "#30008"
 msgid "Advanced settings"
 msgstr ""
 
-#empty strings from id 30009 to 30049
+msgctxt "#30009"
+msgid "Streaming settings"
+msgstr ""
+
+msgctxt "#30010"
+msgid "Timer settings"
+msgstr ""
+
+#empty strings from id 30011 to 30049
 
 msgctxt "#30050"
 msgid "Auto recordings"
@@ -76,7 +84,23 @@ msgctxt "#30054"
 msgid "Maximum start time margin (minutes)"
 msgstr ""
 
-#empty strings from id 30055 to 30099
+msgctxt "#30055"
+msgid "Default priority"
+msgstr ""
+
+msgctxt "#30056"
+msgid "Default lifetime"
+msgstr ""
+
+msgctxt "#30057"
+msgid "Default duplicate detection"
+msgstr ""
+
+msgctxt "#30058"
+msgid "Defaults for new timers"
+msgstr ""
+
+#empty strings from id 30059 to 30099
 
 msgctxt "#30100"
 msgid "Data transfer"
@@ -176,7 +200,145 @@ msgctxt "#30361"
 msgid "Record max once per day"
 msgstr ""
 
-#empty strings from id 30362 to 30399
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30362"
+msgid "This rule only: Record if episode number differs"
+msgstr ""
+
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30363"
+msgid "This rule only: Record if episode name differs"
+msgstr ""
+
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30364"
+msgid "This rule only: Record if title differs"
+msgstr ""
+
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30365"
+msgid "This rule only: Record if description differs"
+msgstr ""
+
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30366"
+msgid "This rule only: Record max once per week"
+msgstr ""
+
+#. Prevent duplicate episodes representation
+#: src/Tvheadend.cpp
+msgctxt "#30367"
+msgid "This rule only: Record max once per day"
+msgstr ""
+
+#empty strings from id 30368 to 30372
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30373"
+msgid "Until space needed"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30374"
+msgid "Forever"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30375"
+msgid "1 day"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30376"
+msgid "3 days"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30377"
+msgid "5 days"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30378"
+msgid "1 week"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30379"
+msgid "2 weeks"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30380"
+msgid "3 weeks"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30381"
+msgid "1 month"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30382"
+msgid "2 months"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30383"
+msgid "3 months"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30384"
+msgid "6 months"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30385"
+msgid "1 year"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30386"
+msgid "2 years"
+msgstr ""
+
+#. Recording lifetime representation
+#: src/Tvheadend.cpp
+msgctxt "#30387"
+msgid "3 years"
+msgstr ""
+
+#. Recording lifetime representation (for setting dialog only)
+msgctxt "#30388"
+msgid "Until space needed (tvh 4.1+)"
+msgstr ""
+
+#. Recording lifetime representation (for setting dialog only)
+msgctxt "#30389"
+msgid "Forever (tvh 4.1+)"
+msgstr ""
+
+#empty strings from id 30390 to 30399
 
 msgctxt "#30400"
 msgid "Predictive tuning"
@@ -227,11 +389,11 @@ msgstr ""
 #empty strings from id 30457 to 30499
 
 msgctxt "#30500"
-msgid "Streaming"
+msgid "Streaming profile"
 msgstr ""
 
 msgctxt "#30501"
-msgid "Streaming profile to use"
+msgid "Profile to use (empty = default)"
 msgstr ""
 
 #. Check streaming profile validity during startup

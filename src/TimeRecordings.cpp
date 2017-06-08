@@ -23,10 +23,12 @@
 
 #include "Tvheadend.h"
 #include "tvheadend/utilities/Utilities.h"
+#include "tvheadend/utilities/Logger.h"
 
 using namespace PLATFORM;
 using namespace tvheadend;
 using namespace tvheadend::entity;
+using namespace tvheadend::utilities;
 
 TimeRecordings::TimeRecordings(CHTSPConnection &conn) :
   m_conn(conn)
@@ -107,31 +109,83 @@ const unsigned int TimeRecordings::GetTimerIntIdFromStringId(const std::string &
     if (tit->second.GetStringId() == strId)
       return tit->second.GetId();
   }
-  tvherror("Timerec: Unable to obtain int id for string id %s", strId.c_str());
+  Logger::Log(LogLevel::LEVEL_ERROR, "Timerec: Unable to obtain int id for string id %s", strId.c_str());
   return 0;
+}
+
+const std::string TimeRecordings::GetTimerStringIdFromIntId(unsigned int intId) const
+{
+  for (auto tit = m_timeRecordings.begin(); tit != m_timeRecordings.end(); ++tit)
+  {
+    if (tit->second.GetId() == intId)
+      return  tit->second.GetStringId();
+  }
+
+  Logger::Log(LogLevel::LEVEL_ERROR, "Timerec: Unable to obtain string id for int id %s", intId);
+  return "";
 }
 
 PVR_ERROR TimeRecordings::SendTimerecAdd(const PVR_TIMER &timer)
 {
+  return SendTimerecAddOrUpdate(timer, false);
+}
+
+PVR_ERROR TimeRecordings::SendTimerecUpdate(const PVR_TIMER &timer)
+{
+  if (m_conn.GetProtocol() >= 25)
+    return SendTimerecAddOrUpdate(timer, true);
+
+  /* Note: there is no "updateTimerec" htsp method for htsp version < 25, thus delete + add. */
+  PVR_ERROR error = SendTimerecDelete(timer);
+
+  if (error == PVR_ERROR_NO_ERROR)
+    error = SendTimerecAdd(timer);
+
+  return error;
+}
+
+PVR_ERROR TimeRecordings::SendTimerecAddOrUpdate(const PVR_TIMER &timer, bool update)
+{
   uint32_t u32;
+  const std::string method = update ? "updateTimerecEntry" : "addTimerecEntry";
+
+  /* Build message */
+  htsmsg_t *m = htsmsg_create_map();
+
+  if (update)
+  {
+    std::string strId = GetTimerStringIdFromIntId(timer.iClientIndex);
+    if (strId.empty())
+    {
+      htsmsg_destroy(m);
+      return PVR_ERROR_FAILED;
+    }
+
+    htsmsg_add_str(m, "id",       strId.c_str());            // Autorec DVR Entry ID (string!)
+  }
 
   char title[PVR_ADDON_NAME_STRING_LENGTH+6];
   const char *titleExt = "%F-%R"; // timerec title should contain the pattern (e.g. %F-%R) for the generated recording files. Scary...
   snprintf(title, sizeof(title), "%s-%s", timer.strTitle, titleExt);
 
-  /* Build message */
-  htsmsg_t *m = htsmsg_create_map();
   htsmsg_add_str(m, "name",       timer.strTitle);
   htsmsg_add_str(m, "title",      title);
   struct tm *tm_start = localtime(&timer.startTime);
   htsmsg_add_u32(m, "start",      tm_start->tm_hour * 60 + tm_start->tm_min); // start time in minutes from midnight
   struct tm *tm_stop = localtime(&timer.endTime);
   htsmsg_add_u32(m, "stop",       tm_stop->tm_hour  * 60 + tm_stop->tm_min);  // end time in minutes from midnight
-  htsmsg_add_u32(m, "channelId",  timer.iClientChannelUid);
-  htsmsg_add_u32(m, "retention",  timer.iLifetime); // remove from tvh database
 
-  if (m_conn.GetProtocol() >= 24)
-    htsmsg_add_u32(m, "removal",  timer.iLifetime); // remove from disk
+  if (m_conn.GetProtocol() >= 25)
+  {
+    htsmsg_add_u32(m, "removal",   timer.iLifetime);          // remove from disk
+    htsmsg_add_u32(m, "retention", DVR_RET_ONREMOVE);         // remove from tvh database
+    htsmsg_add_s64(m, "channelId", timer.iClientChannelUid);  // channelId is signed for >= htspv25
+  }
+  else
+  {
+    htsmsg_add_u32(m, "retention", timer.iLifetime);          // remove from tvh database
+    htsmsg_add_u32(m, "channelId", timer.iClientChannelUid);  // channelId is unsigned for < htspv25
+  }
 
   htsmsg_add_u32(m, "daysOfWeek", timer.iWeekdays);
   htsmsg_add_u32(m, "priority",   timer.iPriority);
@@ -146,7 +200,7 @@ PVR_ERROR TimeRecordings::SendTimerecAdd(const PVR_TIMER &timer)
   /* Send and Wait */
   {
     CLockObject lock(m_conn.Mutex());
-    m = m_conn.SendAndWait("addTimerecEntry", m);
+    m = m_conn.SendAndWait(method.c_str(), m);
   }
 
   if (m == NULL)
@@ -155,7 +209,7 @@ PVR_ERROR TimeRecordings::SendTimerecAdd(const PVR_TIMER &timer)
   /* Check for error */
   if (htsmsg_get_u32(m, "success", &u32))
   {
-    tvherror("malformed addTimerecEntry response: 'success' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed %s response: 'success' missing", method.c_str());
     u32 = PVR_ERROR_FAILED;
   }
   htsmsg_destroy(m);
@@ -163,31 +217,13 @@ PVR_ERROR TimeRecordings::SendTimerecAdd(const PVR_TIMER &timer)
   return u32 == 1 ? PVR_ERROR_NO_ERROR : PVR_ERROR_FAILED;
 }
 
-PVR_ERROR TimeRecordings::SendTimerecUpdate(const PVR_TIMER &timer)
-{
-  /* Note: there is no "updateTimerec" htsp method, thus delete + add. */
-
-  PVR_ERROR error = SendTimerecDelete(timer);
-
-  if (error == PVR_ERROR_NO_ERROR)
-    error = SendTimerecAdd(timer);
-
-  return error;
-}
-
 PVR_ERROR TimeRecordings::SendTimerecDelete(const PVR_TIMER &timer)
 {
   uint32_t u32;
 
-  std::string strId;
-  for (auto tit = m_timeRecordings.begin(); tit != m_timeRecordings.end(); ++tit)
-  {
-    if (tit->second.GetId() == timer.iClientIndex)
-    {
-      strId = tit->second.GetStringId();
-      break;
-    }
-  }
+  std::string strId = GetTimerStringIdFromIntId(timer.iClientIndex);
+  if (strId.empty())
+    return PVR_ERROR_FAILED;
 
   htsmsg_t *m = htsmsg_create_map();
   htsmsg_add_str(m, "id", strId.c_str()); // Timerec DVR Entry ID (string!)
@@ -204,7 +240,7 @@ PVR_ERROR TimeRecordings::SendTimerecDelete(const PVR_TIMER &timer)
   /* Check for error */
   if (htsmsg_get_u32(m, "success", &u32))
   {
-    tvherror("malformed deleteTimerecEntry response: 'success' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed deleteTimerecEntry response: 'success' missing");
   }
   htsmsg_destroy(m);
 
@@ -220,7 +256,7 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   /* Validate/set mandatory fields */
   if ((str = htsmsg_get_str(msg, "id")) == NULL)
   {
-    tvherror("malformed timerecEntryAdd/timerecEntryUpdate: 'id' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd/timerecEntryUpdate: 'id' missing");
     return false;
   }
 
@@ -237,7 +273,7 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed timerecEntryAdd: 'enabled' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'enabled' missing");
     return false;
   }
 
@@ -247,28 +283,33 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed timerecEntryAdd: 'daysOfWeek' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'daysOfWeek' missing");
     return false;
   }
 
-  if (!htsmsg_get_u32(msg, "retention", &u32))
+  if (m_conn.GetProtocol() >= 25)
   {
-    rec.SetRetention(u32);
+    if (!htsmsg_get_u32(msg, "removal", &u32))
+    {
+      rec.SetLifetime(u32);
+    }
+    else if (bAdd)
+    {
+      Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'removal' missing");
+      return false;
+    }
   }
-  else if (bAdd)
+  else
   {
-    tvherror("malformed timerecEntryAdd: 'retention' missing");
-    return false;
-  }
-
-  if (!htsmsg_get_u32(msg, "removal", &u32))
-  {
-    rec.SetRemoval(u32);
-  }
-  else if (bAdd && (m_conn.GetProtocol() >= 24))
-  {
-    tvherror("malformed timerecEntryAdd: 'removal' missing");
-    return false;
+    if (!htsmsg_get_u32(msg, "retention", &u32))
+    {
+      rec.SetLifetime(u32);
+    }
+    else if (bAdd)
+    {
+      Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'retention' missing");
+      return false;
+    }
   }
 
   if (!htsmsg_get_u32(msg, "priority", &u32))
@@ -277,7 +318,7 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed timerecEntryAdd: 'priority' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'priority' missing");
     return false;
   }
 
@@ -287,7 +328,7 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed timerecEntryAdd: 'start' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'start' missing");
     return false;
   }
 
@@ -297,7 +338,7 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed timerecEntryAdd: 'stop' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryAdd: 'stop' missing");
     return false;
   }
 
@@ -331,6 +372,14 @@ bool TimeRecordings::ParseTimerecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   {
     rec.SetChannel(u32);
   }
+  else
+  {
+    /* A timerec can also have an empty channel field,
+     * the user can delete a channel or even an automated bouquet update can do this
+     * let kodi know that no channel is assigned, in this way the user can assign a new channel to this timerec
+     * note: "any channel" will be interpreted as "no channel" for timerecs by kodi */
+    rec.SetChannel(PVR_TIMER_ANY_CHANNEL);
+  }
 
   return true;
 }
@@ -342,10 +391,10 @@ bool TimeRecordings::ParseTimerecDelete(htsmsg_t *msg)
   /* Validate/set mandatory fields */
   if ((id = htsmsg_get_str(msg, "id")) == NULL)
   {
-    tvherror("malformed timerecEntryDelete: 'id' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timerecEntryDelete: 'id' missing");
     return false;
   }
-  tvhtrace("delete timerec entry %s", id);
+  Logger::Log(LogLevel::LEVEL_TRACE, "delete timerec entry %s", id);
 
   /* Erase */
   m_timeRecordings.erase(std::string(id));

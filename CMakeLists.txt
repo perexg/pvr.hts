@@ -16,9 +16,7 @@ include_directories(${kodiplatform_INCLUDE_DIRS}
 add_definitions(-DUSE_DEMUX)
 
 # Sources and headers
-set(HTS_SOURCES src/AsyncState.cpp
-                src/AsyncState.h
-                src/client.h
+set(HTS_SOURCES src/client.h
                 src/client.cpp
                 src/HTSPConnection.cpp
                 src/HTSPDemuxer.cpp
@@ -33,6 +31,7 @@ set(HTS_SOURCES src/AsyncState.cpp
                 src/xbmc_codec_descriptor.hpp)
 
 set(HTS_SOURCES_TVHEADEND
+                src/tvheadend/Profile.h
                 src/tvheadend/Settings.cpp
                 src/tvheadend/Settings.h
                 src/tvheadend/ChannelTuningPredictor.h
@@ -57,13 +56,17 @@ set(HTS_SOURCES_TVHEADEND_ENTITY
                 src/tvheadend/entity/TimeRecording.cpp)
 
 set(HTS_SOURCES_TVHEADEND_STATUS
-        src/tvheadend/status/Quality.h
-        src/tvheadend/status/QueueStatus.h
-        src/tvheadend/status/SourceInfo.h
-        src/tvheadend/status/TimeshiftStatus.h)
+                src/tvheadend/status/Quality.h
+                src/tvheadend/status/QueueStatus.h
+                src/tvheadend/status/SourceInfo.h
+                src/tvheadend/status/TimeshiftStatus.h)
 
 set(HTS_SOURCES_TVHEADEND_UTILITIES
-				src/tvheadend/utilities/Utilities.h)
+                src/tvheadend/utilities/Utilities.h
+                src/tvheadend/utilities/Logger.h
+                src/tvheadend/utilities/Logger.cpp
+                src/tvheadend/utilities/AsyncState.cpp
+                src/tvheadend/utilities/AsyncState.h)
                 
 source_group("Source Files" FILES ${HTS_SOURCES})
 source_group("Source Files\\tvheadend" FILES ${HTS_SOURCES_TVHEADEND})
@@ -86,6 +89,7 @@ source_group("Resource Files" FILES ${HTS_RESOURCES})
 list(APPEND HTS_SOURCES
             ${HTS_SOURCES_TVHEADEND}
             ${HTS_SOURCES_TVHEADEND_ENTITY}
+            ${HTS_SOURCES_TVHEADEND_STATUS}
             ${HTS_SOURCES_TVHEADEND_UTILITIES}
             ${HTS_RESOURCES})
 

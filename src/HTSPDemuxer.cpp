@@ -19,6 +19,7 @@
  *
  */
 
+#include "tvheadend/utilities/Logger.h"
 #include "Tvheadend.h"
 #include "xbmc_codec_descriptor.hpp"
 
@@ -28,13 +29,14 @@ using namespace std;
 using namespace ADDON;
 using namespace PLATFORM;
 using namespace tvheadend;
+using namespace tvheadend::utilities;
 
 CHTSPDemuxer::CHTSPDemuxer ( CHTSPConnection &conn )
   : m_conn(conn), m_pktBuffer((size_t)-1),
     m_seekTime(INVALID_SEEKTIME),
-    m_subscription(conn)
+    m_seeking(false), m_speedChange(false),
+    m_subscription(conn), m_lastUse(0)
 {
-  m_lastUse = 0;
 }
 
 CHTSPDemuxer::~CHTSPDemuxer ()
@@ -46,13 +48,11 @@ void CHTSPDemuxer::Connected ( void )
   /* Re-subscribe */
   if (m_subscription.IsActive())
   {
-    tvhdebug("demux re-starting stream");
-    m_subscription.SendSubscribe(true);
-    m_subscription.SendSpeed(true);
+    Logger::Log(LogLevel::LEVEL_DEBUG, "demux re-starting stream");
+    m_subscription.SendSubscribe(0, 0, true);
+    m_subscription.SendSpeed(0, true);
 
-    /* Reset status */
-    m_signalInfo.Clear();
-    m_sourceInfo.Clear();
+    ResetStatus();
   }
 }
 
@@ -76,13 +76,15 @@ void CHTSPDemuxer::Abort0 ( void )
   CLockObject lock(m_mutex);
   m_streams.Clear();
   m_streamStat.clear();
+  m_seeking = false;
+  m_speedChange = false;
 }
 
 
 bool CHTSPDemuxer::Open ( uint32_t channelId, enum eSubscriptionWeight weight )
 {
   CLockObject lock(m_conn.Mutex());
-  tvhdebug("demux open");
+  Logger::Log(LogLevel::LEVEL_DEBUG, "demux open");
 
   /* Close current stream */
   Close0();
@@ -91,14 +93,13 @@ bool CHTSPDemuxer::Open ( uint32_t channelId, enum eSubscriptionWeight weight )
   m_subscription.SendSubscribe(channelId, weight);
   
   /* Reset status */
-  m_signalInfo.Clear();
-  m_sourceInfo.Clear();
+  ResetStatus();
 
   /* Send unsubscribe if subscribing failed */
   if (!m_subscription.IsActive())
     m_subscription.SendUnsubscribe();
   else
-    m_lastUse = time(NULL);
+    m_lastUse.store(time(nullptr));
   
   return m_subscription.IsActive();
 }
@@ -107,19 +108,20 @@ void CHTSPDemuxer::Close ( void )
 {
   CLockObject lock(m_conn.Mutex());
   Close0();
-  tvhdebug("demux close");
+  Logger::Log(LogLevel::LEVEL_DEBUG, "demux close");
 }
 
 DemuxPacket *CHTSPDemuxer::Read ( void )
 {
   DemuxPacket *pkt = NULL;
-  m_lastUse = time(NULL);
+  m_lastUse.store(time(nullptr));
+
   if (m_pktBuffer.Pop(pkt, 1000)) {
-    tvhtrace("demux read idx :%d pts %lf len %lld",
+    Logger::Log(LogLevel::LEVEL_TRACE, "demux read idx :%d pts %lf len %lld",
              pkt->iStreamId, pkt->pts, (long long)pkt->iSize);
     return pkt;
   }
-  tvhtrace("demux read nothing");
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux read nothing");
   
   return PVR->AllocateDemuxPacket(0);
 }
@@ -127,7 +129,7 @@ DemuxPacket *CHTSPDemuxer::Read ( void )
 void CHTSPDemuxer::Flush ( void )
 {
   DemuxPacket *pkt;
-  tvhtrace("demux flush");
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux flush");
   while (m_pktBuffer.Pop(pkt))
     PVR->FreeDemuxPacket(pkt);
 }
@@ -136,7 +138,7 @@ void CHTSPDemuxer::Trim ( void )
 {
   DemuxPacket *pkt;
 
-  tvhtrace("demux trim");
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux trim");
   /* reduce used buffer space to what is needed for DVDPlayer to resume
    * playback without buffering. This depends on the bitrate, so we don't set
    * this too small. */
@@ -146,7 +148,7 @@ void CHTSPDemuxer::Trim ( void )
 
 void CHTSPDemuxer::Abort ( void )
 {
-  tvhtrace("demux abort");
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux abort");
   CLockObject lock(m_conn.Mutex());
   Abort0();
 }
@@ -157,22 +159,32 @@ bool CHTSPDemuxer::Seek
   if (!m_subscription.IsActive())
     return false;
 
-  if (!m_subscription.SendSeek(time))
+  m_seekTime = 0;
+  m_seeking = true;
+  if (!m_subscription.SendSeek(time)) {
+    m_seeking = false;
     return false;
+  }
 
   /* Wait for time */
+  CLockObject lock(m_conn.Mutex());
+
+  m_seekTime = 0;
   if (!m_seekCond.Wait(m_conn.Mutex(), m_seekTime, Settings::GetInstance().GetResponseTimeout()))
   {
-    tvherror("failed to get subscriptionSeek response");
+    Logger::Log(LogLevel::LEVEL_ERROR, "failed to get subscriptionSeek response");
+    m_seeking = false;
+    Flush(); /* try to resync */
     return false;
   }
   
+  m_seeking = false;
   if (m_seekTime == INVALID_SEEKTIME)
     return false;
 
   /* Store */
-  *startpts = TVH_TO_DVD_TIME(m_seekTime);
-  tvhtrace("demux seek startpts = %lf", *startpts);
+  *startpts = TVH_TO_DVD_TIME(m_seekTime - 1);
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux seek startpts = %lf", *startpts);
 
   return true;
 }
@@ -182,6 +194,10 @@ void CHTSPDemuxer::Speed ( int speed )
   CLockObject lock(m_conn.Mutex());
   if (!m_subscription.IsActive())
     return;
+  if (speed != m_subscription.GetSpeed() && (speed < 0 || speed >= 4000)) {
+    m_speedChange = true;
+    Flush();
+  }
   m_subscription.SendSpeed(speed);
 }
 
@@ -229,6 +245,14 @@ void CHTSPDemuxer::SetStreamingProfile(const std::string &profile)
   m_subscription.SetProfile(profile);
 }
 
+void CHTSPDemuxer::ResetStatus()
+{
+  CLockObject lock(m_mutex);
+
+  m_signalInfo.Clear();
+  m_sourceInfo.Clear();
+}
+
 /* **************************************************************************
  * Parse incoming data
  * *************************************************************************/
@@ -257,7 +281,7 @@ bool CHTSPDemuxer::ProcessMessage ( const char *method, htsmsg_t *m )
   else if (!strcmp("subscriptionSpeed", method))
     ParseSubscriptionSpeed(m);
   else
-    tvhdebug("demux unhandled subscription message [%s]",
+    Logger::Log(LogLevel::LEVEL_DEBUG, "demux unhandled subscription message [%s]",
               method);
 
   return true;
@@ -271,20 +295,20 @@ void CHTSPDemuxer::ParseMuxPacket ( htsmsg_t *m )
   size_t      binlen;
   DemuxPacket *pkt;
   char        _unused(type) = 0;
-  int         iStreamId;
+  int         iStreamId, ignore;
   
   /* Ignore packets while switching channels */
   if (!m_subscription.IsActive())
   {
-    tvhdebug("Ignored mux packet due to channel switch");
+    Logger::Log(LogLevel::LEVEL_DEBUG, "Ignored mux packet due to channel switch");
     return;
   }
   
   /* Validate fields */
   if (htsmsg_get_u32(m, "stream", &idx) ||
       htsmsg_get_bin(m, "payload", &bin, &binlen))
-  { 
-    tvherror("malformed muxpkt: 'stream'/'payload' missing");
+  {
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed muxpkt: 'stream'/'payload' missing");
     return;
   }
 
@@ -294,7 +318,7 @@ void CHTSPDemuxer::ParseMuxPacket ( htsmsg_t *m )
   /* Drop packets for unknown streams */
   if (-1 == (iStreamId = m_streams.GetStreamId(idx)))
   {
-    tvhdebug("Dropped packet with unknown stream index %i", idx);
+    Logger::Log(LogLevel::LEVEL_DEBUG, "Dropped packet with unknown stream index %i", idx);
     return;
   }
   
@@ -326,11 +350,17 @@ void CHTSPDemuxer::ParseMuxPacket ( htsmsg_t *m )
   if (!type)
     type = '_';
 
-  tvhtrace("demux pkt idx %d:%d type %c pts %lf len %lld",
-           idx, pkt->iStreamId, type, pkt->pts, (long long)binlen);
+  ignore = m_seeking || m_speedChange;
+
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux pkt idx %d:%d type %c pts %lf len %lld%s",
+           idx, pkt->iStreamId, type, pkt->pts, (long long)binlen,
+           ignore ? " IGNORE" : "");
 
   /* Store */
-  m_pktBuffer.Push(pkt);
+  if (!ignore)
+    m_pktBuffer.Push(pkt);
+  else
+    PVR->FreeDemuxPacket(pkt);
 }
 
 void CHTSPDemuxer::ParseSubscriptionStart ( htsmsg_t *m )
@@ -343,7 +373,7 @@ void CHTSPDemuxer::ParseSubscriptionStart ( htsmsg_t *m )
   /* Validate */
   if ((l = htsmsg_get_list(m, "streams")) == NULL)
   {
-    tvherror("malformed subscriptionStart: 'streams' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed subscriptionStart: 'streams' missing");
     return;
   }
   m_streamStat.clear();
@@ -365,7 +395,7 @@ void CHTSPDemuxer::ParseSubscriptionStart ( htsmsg_t *m )
     /* Find stream */
     m_streamStat[idx] = 0;
     m_streams.GetStreamData(idx, &stream);
-    tvhdebug("demux subscription start");
+    Logger::Log(LogLevel::LEVEL_DEBUG, "demux subscription start");
     
     CodecDescriptor codecDescriptor = CodecDescriptor::GetCodecByName(type);
     xbmc_codec_t codec = codecDescriptor.Codec();
@@ -417,7 +447,7 @@ void CHTSPDemuxer::ParseSubscriptionStart ( htsmsg_t *m )
            some versions of tvheadend and is here for backward compatibility. */
         if (stream.iWidth == 0 || stream.iHeight == 0)
         {
-          tvhinfo("Ignoring subscriptionStart, stream details missing");
+          Logger::Log(LogLevel::LEVEL_DEBUG, "Ignoring subscriptionStart, stream details missing");
           return;
         }
         
@@ -432,12 +462,12 @@ void CHTSPDemuxer::ParseSubscriptionStart ( htsmsg_t *m )
       }
         
       streams.push_back(stream);
-      tvhdebug("  id: %d, type %s, codec: %u", idx, type, stream.iCodecId);
+      Logger::Log(LogLevel::LEVEL_DEBUG, "  id: %d, type %s, codec: %u", idx, type, stream.iCodecId);
     }
   }
 
   /* Update streams */
-  tvhdebug("demux stream change");
+  Logger::Log(LogLevel::LEVEL_DEBUG, "demux stream change");
   m_streams.UpdateStreams(streams);
   pkt = PVR->AllocateDemuxPacket(0);
   pkt->iStreamId = DMX_SPECIALID_STREAMCHANGE;
@@ -453,42 +483,42 @@ void CHTSPDemuxer::ParseSourceInfo ( htsmsg_t *m )
   
   /* Ignore */
   if (!m) return;
-  
-  tvhtrace("demux sourceInfo:");
+
+  Logger::Log(LogLevel::LEVEL_TRACE, "demux sourceInfo:");
 
   /* include position in mux name
    * as users might receive multiple satellite positions */
   m_sourceInfo.si_mux.clear();
   if ((str = htsmsg_get_str(m, "satpos")) != NULL)
   {
-    tvhtrace("  satpos : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  satpos : %s", str);
     m_sourceInfo.si_mux.append(str);
     m_sourceInfo.si_mux.append(": ");
   }
   if ((str = htsmsg_get_str(m, "mux")) != NULL)
   {
-    tvhtrace("  mux     : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  mux     : %s", str);
     m_sourceInfo.si_mux.append(str);
   }
 
   if ((str = htsmsg_get_str(m, "adapter")) != NULL)
   {
-    tvhtrace("  adapter : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  adapter : %s", str);
     m_sourceInfo.si_adapter  = str;
   }
   if ((str = htsmsg_get_str(m, "network")) != NULL)
   {
-    tvhtrace("  network : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  network : %s", str);
     m_sourceInfo.si_network  = str;
   }
   if ((str = htsmsg_get_str(m, "provider")) != NULL)
   {
-    tvhtrace("  provider : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  provider : %s", str);
     m_sourceInfo.si_provider = str;
   }
   if ((str = htsmsg_get_str(m, "service")) != NULL)
   {
-    tvhtrace("  service : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  service : %s", str);
     m_sourceInfo.si_service  = str;
   }
 }
@@ -504,39 +534,45 @@ void CHTSPDemuxer::ParseSubscriptionSkip ( htsmsg_t *m )
   if (htsmsg_get_s64(m, "time", &s64)) {
     m_seekTime = INVALID_SEEKTIME;
   } else {
-    m_seekTime = s64;
+    m_seekTime = s64 < 0 ? 1 : s64 + 1; /* it must not be zero! */
+    Flush(); /* flush old packets (with wrong pts) */
   }
+  m_seeking = false;
   m_seekCond.Broadcast();
 }
 
 void CHTSPDemuxer::ParseSubscriptionSpeed ( htsmsg_t *m )
 {
-  uint32_t u32;
-  if (!htsmsg_get_u32(m, "speed", &u32))
-    tvhtrace("recv speed %d", u32);
+  int32_t s32;
+  if (!htsmsg_get_s32(m, "speed", &s32))
+    Logger::Log(LogLevel::LEVEL_TRACE, "recv speed %d", s32);
+  if (m_speedChange) {
+    Flush();
+    m_speedChange = false;
+  }
 }
 
 void CHTSPDemuxer::ParseQueueStatus ( htsmsg_t *_unused(m) )
 {
   uint32_t u32;
   map<int,int>::const_iterator it;
-  tvhtrace("stream stats:");
+  Logger::Log(LogLevel::LEVEL_TRACE, "stream stats:");
   for (it = m_streamStat.begin(); it != m_streamStat.end(); ++it)
-    tvhtrace("  idx:%d num:%d", it->first, it->second);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  idx:%d num:%d", it->first, it->second);
 
-  tvhtrace("queue stats:");
+  Logger::Log(LogLevel::LEVEL_TRACE, "queue stats:");
   if (!htsmsg_get_u32(m, "packets", &u32))
-    tvhtrace("  pkts  %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  pkts  %d", u32);
   if (!htsmsg_get_u32(m, "bytes", &u32))
-    tvhtrace("  bytes %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  bytes %d", u32);
   if (!htsmsg_get_u32(m, "delay", &u32))
-    tvhtrace("  delay %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  delay %d", u32);
   if (!htsmsg_get_u32(m, "Idrops", &u32))
-    tvhtrace("  Idrop %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  Idrop %d", u32);
   if (!htsmsg_get_u32(m, "Pdrops", &u32))
-    tvhtrace("  Pdrop %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  Pdrop %d", u32);
   if (!htsmsg_get_u32(m, "Bdrops", &u32))
-    tvhtrace("  Bdrop %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  Bdrop %d", u32);
 }
 
 void CHTSPDemuxer::ParseSignalStatus ( htsmsg_t *m )
@@ -548,34 +584,34 @@ void CHTSPDemuxer::ParseSignalStatus ( htsmsg_t *m )
   m_signalInfo.Clear();
 
   /* Parse */
-  tvhtrace("signalStatus:");
+  Logger::Log(LogLevel::LEVEL_TRACE, "signalStatus:");
   if ((str = htsmsg_get_str(m, "feStatus")) != NULL)
   {
-    tvhtrace("  status : %s", str);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  status : %s", str);
     m_signalInfo.fe_status = str;
   }
   else
   {
-    tvherror("malformed signalStatus: 'feStatus' missing, ignoring");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed signalStatus: 'feStatus' missing, ignoring");
   }
   if (!htsmsg_get_u32(m, "feSNR", &u32))
   {
-    tvhtrace("  snr    : %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  snr    : %d", u32);
     m_signalInfo.fe_snr    = u32;
   }
   if (!htsmsg_get_u32(m, "feBER", &u32))
   {
-    tvhtrace("  ber    : %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  ber    : %d", u32);
     m_signalInfo.fe_ber    = u32;
   }
   if (!htsmsg_get_u32(m, "feUNC", &u32))
   {
-    tvhtrace("  unc    : %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  unc    : %d", u32);
     m_signalInfo.fe_unc    = u32;
   }
   if (!htsmsg_get_u32(m, "feSignal", &u32))
   {
-    tvhtrace("  signal    : %d", u32);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  signal    : %d", u32);
     m_signalInfo.fe_signal = u32;
   }
 }
@@ -586,33 +622,33 @@ void CHTSPDemuxer::ParseTimeshiftStatus ( htsmsg_t *m )
   int64_t s64;
 
   /* Parse */
-  tvhtrace("timeshiftStatus:");
+  Logger::Log(LogLevel::LEVEL_TRACE, "timeshiftStatus:");
   if (!htsmsg_get_u32(m, "full", &u32))
   {
-    tvhtrace("  full  : %d", u32);
-    m_timeshiftStatus.full = (bool)u32;
+    Logger::Log(LogLevel::LEVEL_TRACE, "  full  : %d", u32);
+    m_timeshiftStatus.full = u32 == 0 ? false : true;
   }
   else
   {
-    tvherror("malformed timeshiftStatus: 'full' missing, ignoring");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timeshiftStatus: 'full' missing, ignoring");
   }
   if (!htsmsg_get_s64(m, "shift", &s64))
   {
-    tvhtrace("  shift : %lld", s64);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  shift : %lld", s64);
     m_timeshiftStatus.shift = s64;
   }
   else
   {
-    tvherror("malformed timeshiftStatus: 'shift' missing, ignoring");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed timeshiftStatus: 'shift' missing, ignoring");
   }
   if (!htsmsg_get_s64(m, "start", &s64))
   {
-    tvhtrace("  start : %lld", s64);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  start : %lld", s64);
     m_timeshiftStatus.start = s64;
   }
   if (!htsmsg_get_s64(m, "end", &s64))
   {
-    tvhtrace("  end   : %lld", s64);
+    Logger::Log(LogLevel::LEVEL_TRACE, "  end   : %lld", s64);
     m_timeshiftStatus.end = s64;
   }
 }

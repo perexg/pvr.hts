@@ -24,10 +24,12 @@
 #include "Tvheadend.h"
 #include "tvheadend/Settings.h"
 #include "tvheadend/utilities/Utilities.h"
+#include "tvheadend/utilities/Logger.h"
 
 using namespace PLATFORM;
 using namespace tvheadend;
 using namespace tvheadend::entity;
+using namespace tvheadend::utilities;
 
 AutoRecordings::AutoRecordings(CHTSPConnection &conn) :
   m_conn(conn)
@@ -114,8 +116,8 @@ void AutoRecordings::GetAutorecTimers(std::vector<PVR_TIMER> &timers)
     tmr.firstDay           = 0;                    // not supported by tvh
     tmr.iWeekdays          = tit->second.GetDaysOfWeek();
     tmr.iEpgUid            = PVR_TIMER_NO_EPG_UID; // n/a for repeating timers
-    tmr.iMarginStart       = tit->second.GetMarginStart();
-    tmr.iMarginEnd         = tit->second.GetMarginEnd();
+    tmr.iMarginStart       = static_cast<unsigned int>(tit->second.GetMarginStart());
+	tmr.iMarginEnd         = static_cast<unsigned int>(tit->second.GetMarginEnd());
     tmr.iGenreType         = 0;                    // not supported by tvh?
     tmr.iGenreSubType      = 0;                    // not supported by tvh?
     tmr.bFullTextEpgSearch = tit->second.GetFulltext();
@@ -132,16 +134,61 @@ const unsigned int AutoRecordings::GetTimerIntIdFromStringId(const std::string &
     if (tit->second.GetStringId() == strId)
       return tit->second.GetId();
   }
-  tvherror("Autorec: Unable to obtain int id for string id %s", strId.c_str());
+  Logger::Log(LogLevel::LEVEL_ERROR, "Autorec: Unable to obtain int id for string id %s", strId.c_str());
   return 0;
+}
+
+const std::string AutoRecordings::GetTimerStringIdFromIntId(unsigned int intId) const
+{
+  for (auto tit = m_autoRecordings.begin(); tit != m_autoRecordings.end(); ++tit)
+  {
+    if (tit->second.GetId() == intId)
+      return  tit->second.GetStringId();
+  }
+
+  Logger::Log(LogLevel::LEVEL_ERROR, "Autorec: Unable to obtain string id for int id %s", intId);
+  return "";
 }
 
 PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
 {
+  return SendAutorecAddOrUpdate(timer, false);
+}
+
+PVR_ERROR AutoRecordings::SendAutorecUpdate(const PVR_TIMER &timer)
+{
+  if (m_conn.GetProtocol() >= 25)
+    return SendAutorecAddOrUpdate(timer, true);
+
+  /* Note: there is no "updateAutorec" htsp method for htsp version < 25, thus delete + add. */
+  PVR_ERROR error = SendAutorecDelete(timer);
+
+  if (error == PVR_ERROR_NO_ERROR)
+    error = SendAutorecAdd(timer);
+
+  return error;
+}
+
+PVR_ERROR AutoRecordings::SendAutorecAddOrUpdate(const PVR_TIMER &timer, bool update)
+{
   uint32_t u32;
+  const std::string method = update ? "updateAutorecEntry" : "addAutorecEntry";
 
   /* Build message */
   htsmsg_t *m = htsmsg_create_map();
+
+  if (update)
+  {
+    std::string strId = GetTimerStringIdFromIntId(timer.iClientIndex);
+    if (strId.empty())
+    {
+      htsmsg_destroy(m);
+      return PVR_ERROR_FAILED;
+    }
+
+    htsmsg_add_str(m, "id",       strId.c_str());            // Autorec DVR Entry ID (string!
+  }
+
   htsmsg_add_str(m, "name",       timer.strTitle);
 
   /* epg search data match string (regexp) */
@@ -156,12 +203,22 @@ PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
 
   htsmsg_add_s64(m, "startExtra", timer.iMarginStart);
   htsmsg_add_s64(m, "stopExtra",  timer.iMarginEnd);
-  htsmsg_add_u32(m, "retention",  timer.iLifetime); // remove from tvh database
 
-  if (m_conn.GetProtocol() >= 24)
-    htsmsg_add_u32(m, "removal",  timer.iLifetime); // remove from disk
+  if (m_conn.GetProtocol() >= 25)
+  {
+    htsmsg_add_u32(m, "removal",   timer.iLifetime);            // remove from disk
+    htsmsg_add_u32(m, "retention", DVR_RET_ONREMOVE);           // remove from tvh database
+    htsmsg_add_s64(m, "channelId", timer.iClientChannelUid);    // channelId is signed for >= htspv25, -1 = any
+  }
+  else
+  {
+    htsmsg_add_u32(m, "retention", timer.iLifetime);            // remove from tvh database
 
-  htsmsg_add_u32(m, "daysOfWeek", timer.iWeekdays);
+    if (timer.iClientChannelUid >= 0)
+      htsmsg_add_u32(m, "channelId", timer.iClientChannelUid);  // channelId is unsigned for < htspv25, not sending = any
+  }
+
+  htsmsg_add_u32(m, "daysOfWeek",  timer.iWeekdays);
 
   if (m_conn.GetProtocol() >= 20)
     htsmsg_add_u32(m, "dupDetect", timer.iPreventDuplicateEpisodes);
@@ -175,9 +232,6 @@ PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
   if (strcmp(timer.strDirectory, "/") != 0)
     htsmsg_add_str(m, "directory", timer.strDirectory);
 
-  /* Note: not sending any of the following three values will be interpreted by tvh as "any". */
-  if (timer.iClientChannelUid >= 0)
-    htsmsg_add_u32(m, "channelId", timer.iClientChannelUid);
 
   /* bAutorecApproxTime enabled:  => start time in kodi = approximate start time in tvh     */
   /*                              => 'approximate'      = starting window / 2               */
@@ -229,7 +283,7 @@ PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
   /* Send and Wait */
   {
     CLockObject lock(m_conn.Mutex());
-    m = m_conn.SendAndWait("addAutorecEntry", m);
+    m = m_conn.SendAndWait(method.c_str(), m);
   }
 
   if (m == NULL)
@@ -238,7 +292,7 @@ PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
   /* Check for error */
   if (htsmsg_get_u32(m, "success", &u32))
   {
-    tvherror("malformed addAutorecEntry response: 'success' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed %s response: 'success' missing", method.c_str());
     u32 = PVR_ERROR_FAILED;
   }
   htsmsg_destroy(m);
@@ -246,31 +300,13 @@ PVR_ERROR AutoRecordings::SendAutorecAdd(const PVR_TIMER &timer)
   return u32 == 1 ? PVR_ERROR_NO_ERROR : PVR_ERROR_FAILED;
 }
 
-PVR_ERROR AutoRecordings::SendAutorecUpdate(const PVR_TIMER &timer)
-{
-  /* Note: there is no "updateAutorec" htsp method, thus delete + add. */
-
-  PVR_ERROR error = SendAutorecDelete(timer);
-
-  if (error == PVR_ERROR_NO_ERROR)
-    error = SendAutorecAdd(timer);
-
-  return error;
-}
-
 PVR_ERROR AutoRecordings::SendAutorecDelete(const PVR_TIMER &timer)
 {
   uint32_t u32;
 
-  std::string strId;
-  for (auto tit = m_autoRecordings.begin(); tit != m_autoRecordings.end(); ++tit)
-  {
-    if (tit->second.GetId() == timer.iClientIndex)
-    {
-      strId = tit->second.GetStringId();
-      break;
-    }
-  }
+  std::string strId = GetTimerStringIdFromIntId(timer.iClientIndex);
+  if (strId.empty())
+    return PVR_ERROR_FAILED;
 
   htsmsg_t *m = htsmsg_create_map();
   htsmsg_add_str(m, "id", strId.c_str()); // Autorec DVR Entry ID (string!)
@@ -287,7 +323,7 @@ PVR_ERROR AutoRecordings::SendAutorecDelete(const PVR_TIMER &timer)
   /* Check for error */
   if (htsmsg_get_u32(m, "success", &u32))
   {
-    tvherror("malformed deleteAutorecEntry response: 'success' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed deleteAutorecEntry response: 'success' missing");
   }
   htsmsg_destroy(m);
 
@@ -304,7 +340,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   /* Validate/set mandatory fields */
   if ((str = htsmsg_get_str(msg, "id")) == NULL)
   {
-    tvherror("malformed autorecEntryAdd/autorecEntryUpdate: 'id' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd/autorecEntryUpdate: 'id' missing");
     return false;
   }
 
@@ -321,28 +357,33 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'enabled' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'enabled' missing");
     return false;
   }
 
-  if (!htsmsg_get_u32(msg, "retention", &u32))
+  if (m_conn.GetProtocol() >= 25)
   {
-    rec.SetRetention(u32);
+    if (!htsmsg_get_u32(msg, "removal", &u32))
+    {
+      rec.SetLifetime(u32);
+    }
+    else if (bAdd)
+    {
+      Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'removal' missing");
+      return false;
+    }
   }
-  else if (bAdd)
+  else
   {
-    tvherror("malformed autorecEntryAdd: 'retention' missing");
-    return false;
-  }
-
-  if (!htsmsg_get_u32(msg, "removal", &u32))
-  {
-    rec.SetRemoval(u32);
-  }
-  else if (bAdd && (m_conn.GetProtocol() >= 24))
-  {
-    tvherror("malformed autorecEntryAdd: 'removal' missing");
-    return false;
+    if (!htsmsg_get_u32(msg, "retention", &u32))
+    {
+      rec.SetLifetime(u32);
+    }
+    else if (bAdd)
+    {
+      Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'retention' missing");
+      return false;
+    }
   }
 
   if (!htsmsg_get_u32(msg, "daysOfWeek", &u32))
@@ -351,7 +392,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'daysOfWeek' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'daysOfWeek' missing");
     return false;
   }
 
@@ -361,7 +402,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'priority' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'priority' missing");
     return false;
   }
 
@@ -371,7 +412,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'start' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'start' missing");
     return false;
   }
 
@@ -381,7 +422,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'startWindow' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'startWindow' missing");
     return false;
   }
 
@@ -391,7 +432,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'startExtra' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'startExtra' missing");
     return false;
   }
 
@@ -401,7 +442,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd)
   {
-    tvherror("malformed autorecEntryAdd: 'stopExtra' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'stopExtra' missing");
     return false;
   }
 
@@ -411,7 +452,7 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   }
   else if (bAdd && (m_conn.GetProtocol() >= 20))
   {
-    tvherror("malformed autorecEntryAdd: 'dupDetect' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryAdd: 'dupDetect' missing");
     return false;
   }
 
@@ -445,6 +486,8 @@ bool AutoRecordings::ParseAutorecAddOrUpdate(htsmsg_t *msg, bool bAdd)
   {
     rec.SetChannel(u32);
   }
+  else
+    rec.SetChannel(PVR_TIMER_ANY_CHANNEL); // an empty channel field = any channel
 
   if (!htsmsg_get_u32(msg, "fulltext", &u32))
   {
@@ -461,10 +504,10 @@ bool AutoRecordings::ParseAutorecDelete(htsmsg_t *msg)
   /* Validate/set mandatory fields */
   if ((id = htsmsg_get_str(msg, "id")) == NULL)
   {
-    tvherror("malformed autorecEntryDelete: 'id' missing");
+    Logger::Log(LogLevel::LEVEL_ERROR, "malformed autorecEntryDelete: 'id' missing");
     return false;
   }
-  tvhtrace("delete autorec entry %s", id);
+  Logger::Log(LogLevel::LEVEL_TRACE, "delete autorec entry %s", id);
 
   /* Erase */
   m_autoRecordings.erase(std::string(id));

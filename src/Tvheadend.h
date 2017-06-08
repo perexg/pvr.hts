@@ -31,7 +31,6 @@
 #include "kodi/libXBMC_addon.h"
 #include "tvheadend/Settings.h"
 #include "HTSPTypes.h"
-#include "AsyncState.h"
 #include "tvheadend/ChannelTuningPredictor.h"
 #include "tvheadend/Profile.h"
 #include "tvheadend/entity/Tag.h"
@@ -42,6 +41,7 @@
 #include "tvheadend/status/Quality.h"
 #include "tvheadend/status/SourceInfo.h"
 #include "tvheadend/status/TimeshiftStatus.h"
+#include "tvheadend/utilities/AsyncState.h"
 #include "tvheadend/Subscription.h"
 #include "TimeRecordings.h"
 #include "AutoRecordings.h"
@@ -49,6 +49,7 @@
 #include <queue>
 #include <cstdarg>
 #include <stdexcept>
+#include <atomic>
 
 extern "C" {
 #include <sys/types.h>
@@ -68,32 +69,15 @@ extern "C" {
  * Configuration defines
  */
 #define HTSP_MIN_SERVER_VERSION       (19) // Server must support at least this htsp version
-#define HTSP_CLIENT_VERSION           (24) // Client uses HTSP features up to this version. If the respective
+#define HTSP_CLIENT_VERSION           (25) // Client uses HTSP features up to this version. If the respective
                                            // addon feature requires htsp features introduced after
                                            // HTSP_MIN_SERVER_VERSION this feature will only be available if the
                                            // actual server HTSP version matches (runtime htsp version check).
 #define FAST_RECONNECT_ATTEMPTS     (5)
 #define FAST_RECONNECT_INTERVAL   (500) // ms
+#define SLOW_RECONNECT_INTERVAL  (5000) // ms
 #define UNNUMBERED_CHANNEL      (10000)
 #define INVALID_SEEKTIME           (-1)
-
-/*
- * Log wrappers
- */
-#define tvhdebug(...) tvhlog(ADDON::LOG_DEBUG, ##__VA_ARGS__)
-#define tvhinfo(...)  tvhlog(ADDON::LOG_INFO,  ##__VA_ARGS__)
-#define tvherror(...) tvhlog(ADDON::LOG_ERROR, ##__VA_ARGS__)
-#define tvhtrace(...) if (tvheadend::Settings::GetInstance().GetTraceDebug()) tvhlog(ADDON::LOG_DEBUG, ##__VA_ARGS__)
-static inline void tvhlog ( ADDON::addon_log_t lvl, const char *fmt, ... )
-{
-  char buf[16384];
-  int c = sprintf(buf, "pvr.hts - ");
-  va_list va;
-  va_start(va, fmt);
-  vsnprintf(buf + c, sizeof(buf) - c, fmt, va);
-  va_end(va);
-  XBMC->Log(lvl, "%s", buf);
-}
 
 /*
  * Forward decleration of classes
@@ -280,7 +264,7 @@ public:
   inline time_t GetLastUse() const
   {
     if (m_subscription.IsActive())
-      return m_lastUse;
+      return m_lastUse.load();
     return 0;
   }
 
@@ -291,18 +275,20 @@ public:
   void SetStreamingProfile(const std::string &profile);
 
 private:
-  PLATFORM::CMutex                        m_mutex;
+  mutable PLATFORM::CMutex                m_mutex;
   CHTSPConnection                        &m_conn;
   PLATFORM::SyncedBuffer<DemuxPacket*>    m_pktBuffer;
   ADDON::XbmcStreamProperties             m_streams;
   std::map<int,int>                       m_streamStat;
   int64_t                                 m_seekTime;
   PLATFORM::CCondition<volatile int64_t>  m_seekCond;
+  bool                                    m_seeking;
+  bool                                    m_speedChange;
   tvheadend::status::SourceInfo           m_sourceInfo;
   tvheadend::status::Quality              m_signalInfo;
   tvheadend::status::TimeshiftStatus      m_timeshiftStatus;
   tvheadend::Subscription                 m_subscription;
-  time_t                                  m_lastUse;
+  std::atomic<time_t>                     m_lastUse;
   
   void         Close0         ( void );
   void         Abort0         ( void );
@@ -318,6 +304,11 @@ private:
   void         Weight         ( tvheadend::eSubscriptionWeight weight );
   PVR_ERROR    CurrentStreams ( PVR_STREAM_PROPERTIES *streams );
   PVR_ERROR    CurrentSignal  ( PVR_SIGNAL_STATUS &sig );
+
+  /**
+   * Resets the signal and quality info
+   */
+  void ResetStatus();
   
   void ParseMuxPacket           ( htsmsg_t *m );
   void ParseSourceInfo          ( htsmsg_t *m );
@@ -428,12 +419,6 @@ private:
   bool HasStreamingProfile(const std::string &streamingProfile) const;
 
   /**
-   * @return the streaming profile to use for new subscriptions, or an
-   *         empty string if no particular profile should be used
-   */
-  std::string GetStreamingProfile() const;
-
-  /**
    * The streaming profiles available on the server
    */
   tvheadend::Profiles         m_profiles;
@@ -458,7 +443,7 @@ private:
 
   SHTSPEventList              m_events;
 
-  AsyncState                  m_asyncState;
+  tvheadend::utilities::AsyncState  m_asyncState;
 
   TimeRecordings              m_timeRecordings;
   AutoRecordings              m_autoRecordings;
